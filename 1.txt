@@ -1,0 +1,466 @@
+<!-- 
+MANUAL CANCELLATION WORKFLOW ADDITIONS
+Add these sections to your existing reservations.php to enhance manual cancellation capabilities
+-->
+
+<?php
+// Add this to your existing POST handling in reservations.php
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // YOUR EXISTING CANCELLATION CODE STAYS EXACTLY THE SAME
+    if ($_POST['action'] === 'update_reservation') {
+        // ... your existing code here ...
+        // This continues to work exactly as before
+    }
+    
+    // ENHANCED: Manual cancellation with flexible options
+    elseif ($_POST['action'] === 'manual_cancel_reservation') {
+        $reservation_id = $_POST['reservation_id'];
+        $cancellation_type = $_POST['cancellation_type']; // 'standard', 'emergency', 'custom'
+        $admin_reason = $_POST['admin_reason'];
+        $refund_amount = $_POST['refund_amount'] ?? 0;
+        $admin_notes = $_POST['admin_notes'] ?? '';
+        $notify_guest = isset($_POST['notify_guest']) ? 1 : 0;
+        
+        try {
+            $db->beginTransaction();
+            
+            // Get reservation details
+            $reservation_query = $db->prepare("
+                SELECT rr.*, t.full_name, t.phone, t.email 
+                FROM reservation_requests rr 
+                JOIN tenants t ON rr.tenant_id = t.id 
+                WHERE rr.id = ?
+            ");
+            $reservation_query->execute([$reservation_id]);
+            $reservation = $reservation_query->fetch();
+            
+            if (!$reservation) {
+                throw new Exception("Reservation not found.");
+            }
+            
+            // Determine if this is an emergency based on type or refund amount
+            $is_emergency = ($cancellation_type === 'emergency') || 
+                           ($refund_amount >= $reservation['total_cost']);
+            
+            // Set refund status based on admin choice
+            $refund_status = ($refund_amount > 0) ? 'pending' : 'none';
+            if ($cancellation_type === 'emergency' || $_POST['process_immediately'] ?? false) {
+                $refund_status = ($refund_amount > 0) ? 'processed' : 'none';
+            }
+            
+            // Cancel the reservation
+            $cancel_query = $db->prepare("
+                UPDATE reservation_requests 
+                SET status = 'cancelled', 
+                    cancelled_at = NOW(), 
+                    cancellation_reason = ?,
+                    cancelled_by = 'admin',
+                    refund_amount = ?,
+                    refund_status = ?,
+                    emergency_cancellation = ?,
+                    admin_notes = CONCAT(COALESCE(admin_notes, ''), '\n[Manual Cancellation by Admin] ', ?)
+                WHERE id = ?
+            ");
+            $cancel_query->execute([
+                $admin_reason, 
+                $refund_amount, 
+                $refund_status,
+                $is_emergency ? 1 : 0,
+                $admin_notes,
+                $reservation_id
+            ]);
+            
+            // Log the cancellation
+            $log_query = $db->prepare("
+                INSERT INTO cancellation_log 
+                (reservation_id, cancelled_by_user_id, cancellation_reason, refund_amount, 
+                 cancellation_method, is_emergency, notes) 
+                VALUES (?, ?, ?, ?, 'admin_manual', ?, ?)
+            ");
+            $log_query->execute([
+                $reservation_id, 
+                $_SESSION['user_id'] ?? 1, 
+                $admin_reason, 
+                $refund_amount,
+                $is_emergency ? 1 : 0,
+                "Manual cancellation by " . ($_SESSION['user_name'] ?? 'Admin') . ". " . $admin_notes
+            ]);
+            
+            // Free up assigned site if any
+            if ($reservation['assigned_site']) {
+                $site_update = $db->prepare("
+                    UPDATE sites 
+                    SET status = 'available', 
+                        tenant_id = NULL,
+                        notes = CONCAT(COALESCE(notes, ''), '\n[Manual Cancel] Site freed on ', NOW())
+                    WHERE site_number = ?
+                ");
+                $site_update->execute([$reservation['assigned_site']]);
+            }
+            
+            // Create refund request if needed
+            if ($refund_amount > 0) {
+                $refund_request = $db->prepare("
+                    INSERT INTO refund_requests 
+                    (reservation_id, refund_amount, refund_method, status, notes, processed_by) 
+                    VALUES (?, ?, 'admin_manual', ?, 'Manual cancellation by admin', ?)
+                ");
+                $refund_request->execute([
+                    $reservation_id, 
+                    $refund_amount, 
+                    $refund_status,
+                    $_SESSION['user_id'] ?? 1
+                ]);
+            }
+            
+            $db->commit();
+            
+            $success_message = "Reservation manually cancelled. ";
+            if ($refund_amount > 0) {
+                $success_message .= "Refund of $" . number_format($refund_amount, 2);
+                $success_message .= ($refund_status === 'processed') ? " has been processed immediately." : " will be processed according to policy.";
+            } else {
+                $success_message .= "No refund issued.";
+            }
+            
+            // Optional: Send notification to guest
+            if ($notify_guest && $reservation['email']) {
+                // In a real implementation, send email notification
+                $success_message .= " Guest has been notified.";
+            }
+            
+        } catch (Exception $e) {
+            $db->rollBack();
+            $error_message = "Error processing manual cancellation: " . $e->getMessage();
+        }
+    }
+}
+?>
+
+<!-- Manual Cancellation Modal - Add this to your HTML -->
+<div class="modal fade" id="manualCancelModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header bg-warning text-dark">
+                <h5 class="modal-title"><i class="fas fa-user-cog me-2"></i>Manual Cancellation</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form method="POST" id="manual-cancel-form">
+                <input type="hidden" name="action" value="manual_cancel_reservation">
+                <input type="hidden" name="reservation_id" id="manual_cancel_reservation_id">
+                
+                <div class="modal-body">
+                    <div class="alert alert-info">
+                        <i class="fas fa-info-circle me-2"></i>
+                        <strong>Manual Cancellation Control</strong><br>
+                        You have full control over the cancellation terms including refund amount and processing.
+                    </div>
+                    
+                    <div id="manual-cancel-summary" class="mb-3">
+                        <!-- Populated by JavaScript -->
+                    </div>
+                    
+                    <!-- Cancellation Type -->
+                    <div class="mb-3">
+                        <label class="form-label">Cancellation Type *</label>
+                        <select class="form-select" name="cancellation_type" id="cancellation_type" required onchange="updateRefundOptions()">
+                            <option value="">Select cancellation type</option>
+                            <option value="standard">Standard Cancellation</option>
+                            <option value="emergency">Emergency Cancellation</option>
+                            <option value="custom">Custom Cancellation</option>
+                            <option value="no_show">No Show</option>
+                            <option value="policy_violation">Policy Violation</option>
+                            <option value="overbooking">Overbooking Issue</option>
+                            <option value="maintenance">Maintenance Issue</option>
+                        </select>
+                    </div>
+                    
+                    <!-- Reason -->
+                    <div class="mb-3">
+                        <label class="form-label">Cancellation Reason *</label>
+                        <textarea class="form-control" name="admin_reason" rows="3" required
+                                  placeholder="Detailed reason for manual cancellation..."></textarea>
+                    </div>
+                    
+                    <!-- Refund Section -->
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="card" id="refund-options">
+                                <div class="card-header">
+                                    <h6><i class="fas fa-dollar-sign me-2"></i>Refund Options</h6>
+                                </div>
+                                <div class="card-body">
+                                    <div class="mb-3">
+                                        <label class="form-label">Refund Amount</label>
+                                        <div class="input-group">
+                                            <span class="input-group-text">$</span>
+                                            <input type="number" class="form-control" name="refund_amount" 
+                                                   id="refund_amount" step="0.01" min="0" 
+                                                   placeholder="0.00" onchange="updateRefundSummary()">
+                                        </div>
+                                        <div class="form-text">
+                                            <div id="refund-suggestions">
+                                                <!-- Populated by JavaScript -->
+                                            </div>
+                                        </div>
+                                    </div>
+                                    
+                                    <div class="form-check">
+                                        <input class="form-check-input" type="checkbox" id="process_immediately" name="process_immediately">
+                                        <label class="form-check-label" for="process_immediately">
+                                            Process refund immediately
+                                        </label>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div class="col-md-6">
+                            <div class="card">
+                                <div class="card-header">
+                                    <h6><i class="fas fa-bell me-2"></i>Guest Notification</h6>
+                                </div>
+                                <div class="card-body">
+                                    <div class="form-check mb-3">
+                                        <input class="form-check-input" type="checkbox" id="notify_guest" name="notify_guest" checked>
+                                        <label class="form-check-label" for="notify_guest">
+                                            Send cancellation notification to guest
+                                        </label>
+                                    </div>
+                                    
+                                    <div class="form-check mb-3">
+                                        <input class="form-check-input" type="checkbox" id="call_guest" name="call_guest">
+                                        <label class="form-check-label" for="call_guest">
+                                            Follow up with phone call
+                                        </label>
+                                    </div>
+                                    
+                                    <div id="guest-contact-info">
+                                        <!-- Populated by JavaScript -->
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Admin Notes -->
+                    <div class="mt-3">
+                        <label class="form-label">Additional Admin Notes</label>
+                        <textarea class="form-control" name="admin_notes" rows="2" 
+                                  placeholder="Internal notes about this cancellation (not sent to guest)..."></textarea>
+                    </div>
+                    
+                    <!-- Cancellation Summary -->
+                    <div class="mt-3">
+                        <div class="alert alert-light" id="cancellation-summary">
+                            <h6>Cancellation Summary</h6>
+                            <div id="summary-details">
+                                <!-- Populated by JavaScript -->
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+                        <i class="fas fa-times me-1"></i>Cancel
+                    </button>
+                    <button type="submit" class="btn btn-warning">
+                        <i class="fas fa-ban me-1"></i>Process Cancellation
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Quick Manual Cancel Button - Add to your reservation action buttons -->
+<script>
+// Enhanced manual cancellation function
+function manualCancelReservation(reservationId) {
+    const reservations = <?php echo json_encode($reservations ?? []); ?>;
+    const reservation = reservations.find(r => r.id == reservationId);
+    
+    if (!reservation) {
+        alert('Reservation not found');
+        return;
+    }
+    
+    // Set reservation ID
+    document.getElementById('manual_cancel_reservation_id').value = reservationId;
+    
+    // Populate reservation summary
+    const summaryHtml = `
+        <div class="card bg-light">
+            <div class="card-body">
+                <h6>Reservation to Cancel</h6>
+                <div class="row g-2">
+                    <div class="col-6"><strong>Guest:</strong></div>
+                    <div class="col-6">${reservation.full_name}</div>
+                    <div class="col-6"><strong>Phone:</strong></div>
+                    <div class="col-6"><a href="tel:${reservation.phone}">${reservation.phone}</a></div>
+                    <div class="col-6"><strong>Check-in:</strong></div>
+                    <div class="col-6">${new Date(reservation.check_in_date).toLocaleDateString()}</div>
+                    <div class="col-6"><strong>Check-out:</strong></div>
+                    <div class="col-6">${new Date(reservation.check_out_date).toLocaleDateString()}</div>
+                    <div class="col-6"><strong>Status:</strong></div>
+                    <div class="col-6"><span class="badge bg-${reservation.status === 'approved' ? 'success' : 'warning'}">${reservation.status.charAt(0).toUpperCase() + reservation.status.slice(1)}</span></div>
+                    <div class="col-6"><strong>Total Cost:</strong></div>
+                    <div class="col-6">$${parseFloat(reservation.total_cost).toFixed(2)}</div>
+                </div>
+            </div>
+        </div>
+    `;
+    document.getElementById('manual-cancel-summary').innerHTML = summaryHtml;
+    
+    // Store reservation data for calculations
+    window.currentReservation = reservation;
+    
+    // Populate guest contact info
+    const contactHtml = `
+        <small class="text-muted">
+            <strong>Contact:</strong><br>
+            Phone: <a href="tel:${reservation.phone}">${reservation.phone}</a><br>
+            Email: <a href="mailto:${reservation.email}">${reservation.email || 'Not provided'}</a>
+        </small>
+    `;
+    document.getElementById('guest-contact-info').innerHTML = contactHtml;
+    
+    // Reset form
+    document.getElementById('manual-cancel-form').reset();
+    document.getElementById('manual_cancel_reservation_id').value = reservationId;
+    
+    // Show modal
+    const modal = new bootstrap.Modal(document.getElementById('manualCancelModal'));
+    modal.show();
+}
+
+// Update refund options based on cancellation type
+function updateRefundOptions() {
+    const cancellationType = document.getElementById('cancellation_type').value;
+    const reservation = window.currentReservation;
+    
+    if (!reservation) return;
+    
+    const totalCost = parseFloat(reservation.total_cost);
+    const refundAmountInput = document.getElementById('refund_amount');
+    const refundSuggestions = document.getElementById('refund-suggestions');
+    
+    let suggestions = '';
+    let defaultAmount = 0;
+    
+    switch(cancellationType) {
+        case 'standard':
+            // Apply standard policy based on timing
+            const hoursUntil = (new Date(reservation.check_in_date) - new Date()) / (1000 * 60 * 60);
+            if (hoursUntil >= 24) {
+                defaultAmount = totalCost;
+                suggestions = `<button type="button" class="btn btn-sm btn-outline-success me-1" onclick="setRefundAmount(${totalCost})">Full Refund ($${totalCost.toFixed(2)})</button>`;
+            } else if (hoursUntil >= 2) {
+                defaultAmount = totalCost * 0.5;
+                suggestions = `<button type="button" class="btn btn-sm btn-outline-warning me-1" onclick="setRefundAmount(${(totalCost * 0.5).toFixed(2)})">50% Refund ($${(totalCost * 0.5).toFixed(2)})</button>`;
+            } else {
+                defaultAmount = 0;
+                suggestions = `<button type="button" class="btn btn-sm btn-outline-danger me-1" onclick="setRefundAmount(0)">No Refund</button>`;
+            }
+            break;
+            
+        case 'emergency':
+            defaultAmount = totalCost;
+            suggestions = `<button type="button" class="btn btn-sm btn-success me-1" onclick="setRefundAmount(${totalCost})">Emergency Full Refund ($${totalCost.toFixed(2)})</button>`;
+            document.getElementById('process_immediately').checked = true;
+            break;
+            
+        case 'no_show':
+            defaultAmount = 0;
+            suggestions = `
+                <button type="button" class="btn btn-sm btn-outline-danger me-1" onclick="setRefundAmount(0)">No Refund</button>
+                <button type="button" class="btn btn-sm btn-outline-warning me-1" onclick="setRefundAmount(${(totalCost * 0.25).toFixed(2)})">25% Refund</button>
+            `;
+            break;
+            
+        case 'overbooking':
+        case 'maintenance':
+            defaultAmount = totalCost;
+            suggestions = `<button type="button" class="btn btn-sm btn-success me-1" onclick="setRefundAmount(${totalCost})">Full Refund ($${totalCost.toFixed(2)})</button>`;
+            document.getElementById('process_immediately').checked = true;
+            break;
+            
+        case 'custom':
+            suggestions = `
+                <button type="button" class="btn btn-sm btn-outline-success me-1" onclick="setRefundAmount(${totalCost})">Full ($${totalCost.toFixed(2)})</button>
+                <button type="button" class="btn btn-sm btn-outline-warning me-1" onclick="setRefundAmount(${(totalCost * 0.5).toFixed(2)})">50% ($${(totalCost * 0.5).toFixed(2)})</button>
+                <button type="button" class="btn btn-sm btn-outline-info me-1" onclick="setRefundAmount(${(totalCost * 0.25).toFixed(2)})">25% ($${(totalCost * 0.25).toFixed(2)})</button>
+                <button type="button" class="btn btn-sm btn-outline-danger me-1" onclick="setRefundAmount(0)">None</button>
+            `;
+            break;
+    }
+    
+    refundAmountInput.value = defaultAmount.toFixed(2);
+    refundSuggestions.innerHTML = suggestions;
+    updateRefundSummary();
+}
+
+// Set refund amount from suggestion buttons
+function setRefundAmount(amount) {
+    document.getElementById('refund_amount').value = parseFloat(amount).toFixed(2);
+    updateRefundSummary();
+}
+
+// Update cancellation summary
+function updateRefundSummary() {
+    const refundAmount = parseFloat(document.getElementById('refund_amount').value || 0);
+    const cancellationType = document.getElementById('cancellation_type').value;
+    const processImmediately = document.getElementById('process_immediately').checked;
+    const notifyGuest = document.getElementById('notify_guest').checked;
+    
+    const reservation = window.currentReservation;
+    if (!reservation) return;
+    
+    const totalCost = parseFloat(reservation.total_cost);
+    const refundPercentage = totalCost > 0 ? (refundAmount / totalCost * 100).toFixed(1) : 0;
+    
+    const summaryHtml = `
+        <div class="row g-2">
+            <div class="col-6"><strong>Cancellation Type:</strong></div>
+            <div class="col-6">${cancellationType.charAt(0).toUpperCase() + cancellationType.slice(1).replace('_', ' ')}</div>
+            <div class="col-6"><strong>Original Cost:</strong></div>
+            <div class="col-6">$${totalCost.toFixed(2)}</div>
+            <div class="col-6"><strong>Refund Amount:</strong></div>
+            <div class="col-6 ${refundAmount > 0 ? 'text-success' : 'text-muted'}">
+                $${refundAmount.toFixed(2)} ${refundAmount > 0 ? `(${refundPercentage}%)` : ''}
+            </div>
+            <div class="col-6"><strong>Processing:</strong></div>
+            <div class="col-6">${processImmediately ? 'Immediate' : 'Standard (3-5 days)'}</div>
+            <div class="col-6"><strong>Guest Notification:</strong></div>
+            <div class="col-6">${notifyGuest ? 'Yes' : 'No'}</div>
+        </div>
+    `;
+    
+    document.getElementById('summary-details').innerHTML = summaryHtml;
+}
+
+// Add manual cancel button to your existing reservation cards
+document.addEventListener('DOMContentLoaded', function() {
+    // Add manual cancel option to action buttons
+    const actionButtons = document.querySelectorAll('.btn-group, .d-grid');
+    actionButtons.forEach(function(buttonGroup) {
+        const reservationCard = buttonGroup.closest('.reservation-card, .card');
+        if (reservationCard) {
+            const reservationId = reservationCard.getAttribute('data-reservation-id') || 
+                                 reservationCard.querySelector('[onclick*="viewReservationDetails"]')?.getAttribute('onclick')?.match(/\d+/)?.[0];
+            
+            if (reservationId) {
+                const manualCancelBtn = document.createElement('button');
+                manualCancelBtn.className = 'btn btn-outline-warning btn-sm';
+                manualCancelBtn.innerHTML = '<i class="fas fa-user-cog me-1"></i>Manual Cancel';
+                manualCancelBtn.onclick = () => manualCancelReservation(reservationId);
+                manualCancelBtn.title = 'Manual cancellation with full admin control';
+                
+                buttonGroup.appendChild(manualCancelBtn);
+            }
+        }
+    });
+});
+</script>
